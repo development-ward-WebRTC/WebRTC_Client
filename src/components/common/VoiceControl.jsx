@@ -26,7 +26,7 @@ const VoiceControl = ({ peerConnection }) => {
       // 오디오 트랙을 PeerConnection에 추가
       if (peerConnection && peerConnection.signalingState !== "closed") {
         stream.getTracks().forEach((track) => {
-          p; // track.kind가 'audio'인 트랙만 추가하는 것이 안전합니다.
+          // track.kind가 'audio'인 트랙만 추가하는 것이 안전합니다.
           if (track.kind === "audio") {
             peerConnection.addTrack(track, stream);
           }
