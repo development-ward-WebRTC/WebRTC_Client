@@ -66,14 +66,31 @@ const GameBoard = ({ user }) => {
       emitSignaling("game-init", { state: gameState });
     }
 
-    if (!isHost && connectionState === "connected" && !gameState) {
-      emitSignaling("request-game-init", { requester: user.userId });
-      const timer = setTimeout(() => {
+    // 게스트가 방에 참가했는데 초기 상태가 없으면 호스트에게 요청
+    // 연결 상태와 관계없이 요청 (시그널링으로 받을 수 있음)
+    if (!isHost && !gameState) {
+      const timer1 = setTimeout(() => {
         if (!gameState) {
-          emitSignaling("request-game-init", { requester: user.userId, retry: true });
+          console.log("Guest: requesting game-init (initial)");
+          emitSignaling("request-game-init", { requester: user.userId });
         }
-      }, 2000);
-      return () => clearTimeout(timer);
+      }, 1000);
+      
+      // 연결이 완전히 수립된 경우에도 재요청
+      if (connectionState === "connected") {
+        const timer2 = setTimeout(() => {
+          if (!gameState) {
+            console.log("Guest: requesting game-init (after connected)");
+            emitSignaling("request-game-init", { requester: user.userId, retry: true });
+          }
+        }, 2000);
+        return () => {
+          clearTimeout(timer1);
+          clearTimeout(timer2);
+        };
+      }
+      
+      return () => clearTimeout(timer1);
     }
   }, [isHost, connectionState, gameState, sendMessage, emitSignaling, user.userId]);
 
@@ -422,15 +439,39 @@ const GameBoard = ({ user }) => {
 
           {/* 액션 버튼 */}
           {isMyTurn && (
-            <div className="flex justify-center">
-              <button
-                onClick={handleAdvancePhase}
-                className="px-8 py-4 bg-gradient-to-br from-[#3b82f6] to-[#2563eb] hover:from-[#2563eb] hover:to-[#1d4ed8] text-white rounded-lg font-bold text-lg transition-all shadow-lg hover:shadow-xl hover:translate-y-[-3px] border-2 border-[#3b82f6]"
-              >
-                {gameState.phase === "draw" && "🎴 카드 뽑기"}
-                {gameState.phase === "main" && "⚔️ 전투 시작"}
-                {gameState.phase === "combat" && "✅ 턴 종료"}
-              </button>
+            <div className="flex justify-center gap-4">
+              {gameState.phase === "draw" && (
+                <button
+                  onClick={handleAdvancePhase}
+                  className="px-8 py-4 bg-gradient-to-br from-[#3b82f6] to-[#2563eb] hover:from-[#2563eb] hover:to-[#1d4ed8] text-white rounded-lg font-bold text-lg transition-all shadow-lg hover:shadow-xl hover:translate-y-[-3px] border-2 border-[#3b82f6]"
+                >
+                  🎴 카드 뽑기
+                </button>
+              )}
+              {gameState.phase === "main" && (
+                <>
+                  <button
+                    onClick={handleAdvancePhase}
+                    className="px-8 py-4 bg-gradient-to-br from-[#3b82f6] to-[#2563eb] hover:from-[#2563eb] hover:to-[#1d4ed8] text-white rounded-lg font-bold text-lg transition-all shadow-lg hover:shadow-xl hover:translate-y-[-3px] border-2 border-[#3b82f6]"
+                  >
+                    ⚔️ 전투 시작
+                  </button>
+                  <button
+                    onClick={endTurn}
+                    className="px-8 py-4 bg-gradient-to-br from-[#6b7280] to-[#4b5563] hover:from-[#4b5563] hover:to-[#374151] text-white rounded-lg font-bold text-lg transition-all shadow-lg hover:shadow-xl hover:translate-y-[-3px] border-2 border-[#6b7280]"
+                  >
+                    ⏭️ 턴 종료
+                  </button>
+                </>
+              )}
+              {gameState.phase === "combat" && (
+                <button
+                  onClick={handleAdvancePhase}
+                  className="px-8 py-4 bg-gradient-to-br from-[#3b82f6] to-[#2563eb] hover:from-[#2563eb] hover:to-[#1d4ed8] text-white rounded-lg font-bold text-lg transition-all shadow-lg hover:shadow-xl hover:translate-y-[-3px] border-2 border-[#3b82f6]"
+                >
+                  ✅ 턴 종료
+                </button>
+              )}
             </div>
           )}
         </div>
