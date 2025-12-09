@@ -294,7 +294,7 @@ const GameBoard = ({ user }) => {
           </div>
 
           {/* 💡 VoiceControl 컴포넌트 삽입 */}
-          <VoiceControl peerConnection={peerConnection} />
+          <VoiceControl peerConnection={peerConnection} connectionState={connectionState} />
 
           <button
             onClick={handleExit}
