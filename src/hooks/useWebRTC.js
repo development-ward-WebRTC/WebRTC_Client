@@ -15,6 +15,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   const [connectionState, setConnectionState] = useState("disconnected");
   const [isHost, setIsHost] = useState(false);
   const [guestJoined, setGuestJoined] = useState(false);
+  const [peerConnectionState, setPeerConnectionState] = useState(null);
 
   // useRef는 React의 Hooks 중 하나로, 컴포넌트의 수명 주기 동안 변경 가능(Mutable)한 값을 저장하는 데 사용된다. 이 값은 상태(useState)와 달리 업데이트되어도 컴포넌트를 재렌더링(Re-render)시키지 않는다는 특징을 가지고 있다.
   const socketRef = useRef(null);
@@ -52,8 +53,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
         console.log("Offer sent");
       } catch (error) {
         console.error("Failed to create offer:", error);
-      }
-      finally {
+      } finally {
         isMakingOfferRef.current = false;
       }
     },
@@ -70,9 +70,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       }
 
       const offerDesc = new RTCSessionDescription(offer);
-      const offerCollision =
-        offerDesc.type === "offer" &&
-        (isMakingOfferRef.current || pc.signalingState !== "stable");
+      const offerCollision = offerDesc.type === "offer" && (isMakingOfferRef.current || pc.signalingState !== "stable");
 
       ignoreOfferRef.current = !isPoliteRef.current && offerCollision;
       if (ignoreOfferRef.current) {
@@ -163,9 +161,13 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   // ICE Candidate 처리
   const handleIceCandidate = async (candidate) => {
     try {
-      const pc = ensurePeerConnection(!isPoliteRef.current); // host:true, guest:false
-      if (!pc) {
-        console.error("PeerConnection not initialized");
+      const pc = peerConnectionRef.current; // host:true, guest:false
+      // 💡 PeerConnection이 없거나 닫힌 경우 초기화
+      if (!pc || pc.signalingState === "closed") {
+        // isPoliteRef.current의 반전 값(Host 역할)을 전달하여 초기화
+        initializePeerConnection(!isPoliteRef.current);
+        // 재귀적으로 다시 호출되도록 pendingCandidatesRef에 저장 후 return
+        pendingCandidatesRef.current.push(candidate);
         return;
       }
 
@@ -282,6 +284,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     */
       const pc = new RTCPeerConnection(ICE_CONFIG);
       peerConnectionRef.current = pc;
+      setPeerConnectionState(pc);
 
       // ICE Candidate 수집
       /* 
@@ -358,17 +361,6 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       }
     },
     [roomId, onConnecitionChange, createAndSendOffer, flushMessageQueue, setupDataChannel]
-  );
-
-  // 닫힌 PeerConnection을 재사용하지 않도록 보조 함수
-  const ensurePeerConnection = useCallback(
-    (isInitiator) => {
-      if (!peerConnectionRef.current || peerConnectionRef.current.signalingState === "closed") {
-        initializePeerConnection(isInitiator);
-      }
-      return peerConnectionRef.current;
-    },
-    [initializePeerConnection]
   );
 
   useEffect(() => {
@@ -514,13 +506,16 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   }, [setupSocketListeners]);
 
   // emit via signaling socket helper
-  const emitSignaling = useCallback((event, payload) => {
-    if (socketRef.current) {
-      const data = { roomId, ...(payload || {}) };
-      console.log("Emit signaling", event, data);
-      socketRef.current.emit(event, data);
-    }
-  }, [roomId]);
+  const emitSignaling = useCallback(
+    (event, payload) => {
+      if (socketRef.current) {
+        const data = { roomId, ...(payload || {}) };
+        console.log("Emit signaling", event, data);
+        socketRef.current.emit(event, data);
+      }
+    },
+    [roomId]
+  );
 
   return {
     connectionState,
@@ -530,6 +525,6 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     joinRoom,
     sendMessage,
     emitSignaling,
-    peerConnection: peerConnectionRef,
+    peerConnection: peerConnectionState,
   };
 };

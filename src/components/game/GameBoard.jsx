@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useWebRTC } from "../../hooks/useWebRTC";
 import { useGameState } from "../../hooks/useGameState";
+import VoiceControl from "../common/VoiceControl";
 
 const GameBoard = ({ user }) => {
   const { roomId } = useParams();
@@ -10,7 +11,7 @@ const GameBoard = ({ user }) => {
   const [spellTarget, setSpellTarget] = useState(null);
 
   // WebRTC 연결
-  const { connectionState, isHost, guestJoined, sendMessage, joinRoom, emitSignaling } = useWebRTC(
+  const { connectionState, isHost, guestJoined, sendMessage, joinRoom, emitSignaling, peerConnection } = useWebRTC(
     roomId,
     handleMessage,
     handleConnectionChange
@@ -274,6 +275,10 @@ const GameBoard = ({ user }) => {
           <div className="text-blue-100">
             턴 {gameState.turn} | 페이즈: <span className="font-bold text-blue-300">{gameState.phase}</span>
           </div>
+
+          {/* 💡 VoiceControl 컴포넌트 삽입 */}
+          <VoiceControl peerConnection={peerConnection} />
+
           <button
             onClick={handleExit}
             className="px-4 py-2 bg-gradient-to-br from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white rounded-lg transition-all font-bold border border-red-500 shadow-lg"
