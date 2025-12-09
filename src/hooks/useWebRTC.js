@@ -1,7 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import io from "socket.io-client";
-
-const SIGNALING_SERVER = import.meta.env.VITE_REACT_APP_SIGNALING_SERVER || "http://localhost:3001";
+import { getSignalingSocket, SIGNALING_SERVER } from "../utils/signalingSocket";
 
 // ICE(Interactive Connectivity Establishment)는 두 Peer의 사용자가 서로의 네트워크 주소를 찾아 직접 통신 경로를 확립하는 과정이다.
 // STUN 서버 역할: 클라이언트의 공인 IP 주소와 포트를 알려주는 역할을 한다. 이는 NAT 뒤에 숨어진 Peer가 자신의 외부 주소를 알아내어 서로 연결할 수 있는 후보를 생성하는데 사용된다.
@@ -16,6 +14,7 @@ const ICE_CONFIG = {
 export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   const [connectionState, setConnectionState] = useState("disconnected");
   const [isHost, setIsHost] = useState(false);
+  const [guestJoined, setGuestJoined] = useState(false);
 
   // useRef는 React의 Hooks 중 하나로, 컴포넌트의 수명 주기 동안 변경 가능(Mutable)한 값을 저장하는 데 사용된다. 이 값은 상태(useState)와 달리 업데이트되어도 컴포넌트를 재렌더링(Re-render)시키지 않는다는 특징을 가지고 있다.
   const socketRef = useRef(null);
@@ -25,20 +24,21 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   const reconnectTimeoutRef = useRef(null);
   const initializePCRef = useRef(null);
   const attemptReconnectFuncRef = useRef(null);
+  const hasGuestRef = useRef(false);
+  const isNegotiatingRef = useRef(false);
+  const pendingCandidatesRef = useRef([]);
+  // Perfect negotiation 관련 플래그
+  const isMakingOfferRef = useRef(false);
+  const ignoreOfferRef = useRef(false);
+  const isSettingRemoteAnswerPendingRef = useRef(false);
+  const isPoliteRef = useRef(false); // guest=true, host=false
 
   // Offer 생성 및 전송
   const createAndSendOffer = useCallback(
     async (pc) => {
       try {
-        // 1. Offer 생성
-        /* 
-        RTCPeerConnection 객체에게 현재 로컬 머신의 잠재적 미디어 포맷, 프로토콜, 암호화 키 등의 정보가 담긴 SDP Offer를 생성하도록 지시한다.
-      */
+        isMakingOfferRef.current = true;
         const offer = await pc.createOffer();
-        // 2. Local Description 설정
-        /* 
-        생성된 offer 정보를 자신의 로컬 연결 설정으로 등록한다. 이 정보가 등록되어야 pc.localDescription을 통해 접근할 수 있다.
-      */
         await pc.setLocalDescription(offer);
 
         // 3. Offer 전송 (시그널링)
@@ -53,11 +53,14 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       } catch (error) {
         console.error("Failed to create offer:", error);
       }
+      finally {
+        isMakingOfferRef.current = false;
+      }
     },
     [roomId]
   );
 
-  // Offer 처리
+  // Offer/Answer 처리 (Perfect Negotiation)
   const handleOffer = async (offer) => {
     try {
       const pc = peerConnectionRef.current;
@@ -66,34 +69,60 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
         return;
       }
 
-      // 1. Remote Description 설정
-      /* 
-        상대방(Host)이 보낸 Offer(SDP)를 자신의 원격 연결 설정으로 등록한다. pc는 상대방이 원하는 연결 사양을 알게 된다.
-      */
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const offerDesc = new RTCSessionDescription(offer);
+      const offerCollision =
+        offerDesc.type === "offer" &&
+        (isMakingOfferRef.current || pc.signalingState !== "stable");
 
-      // 2. Answer 생성
-      /* 
-        상대방의 Offer를 바탕으로 호환되는 미디어 및 네트워크 설정을 담은 SDP Answer를 생성한다.
-      */
-      const answer = await pc.createAnswer();
-      // 3. Local Description 설정
-      /* 
-        생성된 Answer를 자신의 로컬 연결 설정으로 등록한다.
-      */
-      await pc.setLocalDescription(answer);
+      ignoreOfferRef.current = !isPoliteRef.current && offerCollision;
+      if (ignoreOfferRef.current) {
+        console.warn("Ignoring offer due to collision (impolite side)");
+        return;
+      }
 
-      // 4. Answer 전송 (시그널링)
-      /* 
-        Answer(SDP)를 시그널링 서버를 통해 Offer를 보냈던 Host에게 다시 전달한다. 이 Answer를 Host가 수신하여 등록하면 SDP 교환이 완료되고, WebRTC 연결이 본격적으로 시작된다.
-      */
-      socketRef.current.emit("answer", {
-        roomId,
-        answer: pc.localDescription,
-      });
-      console.log("Answer sent");
+      isSettingRemoteAnswerPendingRef.current = offerDesc.type === "answer";
+
+      if (offerDesc.type === "offer") {
+        if (pc.signalingState !== "stable") {
+          await pc.setLocalDescription({ type: "rollback" });
+        }
+        await pc.setRemoteDescription(offerDesc);
+
+        // Flush pending ICE now that remote description is set
+        while (pendingCandidatesRef.current.length > 0) {
+          const queued = pendingCandidatesRef.current.shift();
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(queued));
+          } catch (e) {
+            console.error("Failed to add queued ICE candidate:", e);
+          }
+        }
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        socketRef.current.emit("answer", {
+          roomId,
+          answer: pc.localDescription,
+        });
+        console.log("Answer sent");
+      } else {
+        await pc.setRemoteDescription(offerDesc);
+        // Flush pending ICE now that remote description is set
+        while (pendingCandidatesRef.current.length > 0) {
+          const queued = pendingCandidatesRef.current.shift();
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(queued));
+          } catch (e) {
+            console.error("Failed to add queued ICE candidate:", e);
+          }
+        }
+        console.log("Answer processed");
+      }
     } catch (error) {
       console.error("Failed to handle offer:", error);
+    } finally {
+      isSettingRemoteAnswerPendingRef.current = false;
     }
   };
 
@@ -117,6 +146,14 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
         역할: Offer를 보냈던 Host는 이 Answer를 등록함으로써, SDP 교환을 최종적으로 완료하고 두 피어 간의 통신 사양에 대한 최종 합의를 이끌어낸다.
       */
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      while (pendingCandidatesRef.current.length > 0) {
+        const queued = pendingCandidatesRef.current.shift();
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(queued));
+        } catch (e) {
+          console.error("Failed to add queued ICE candidate:", e);
+        }
+      }
       console.log("Answer processed");
     } catch (error) {
       console.error("Failed to handle answer:", error);
@@ -126,9 +163,14 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   // ICE Candidate 처리
   const handleIceCandidate = async (candidate) => {
     try {
-      const pc = peerConnectionRef.current;
+      const pc = ensurePeerConnection(!isPoliteRef.current); // host:true, guest:false
       if (!pc) {
         console.error("PeerConnection not initialized");
+        return;
+      }
+
+      if (!pc.remoteDescription || !pc.remoteDescription.type) {
+        pendingCandidatesRef.current.push(candidate);
         return;
       }
 
@@ -209,6 +251,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     },
     [flushMessageQueue, onMessage]
   );
+
   // 재연결 시도 (hoisted function)
   /* 
     clearTimeout(...): 만약 재연결 요청이 빠르게 여러 번 들어오면 (예: 네트워크가 불안정할 때), 이미 실행 대기 중인 이전 타이머를 취소한다.
@@ -224,6 +267,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       console.log("Attempting to reconnect...");
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
+        peerConnectionRef.current = null;
       }
       // Use the ref to avoid accessing initializePeerConnection before it's declared
       initializePCRef.current?.(isHost);
@@ -287,15 +331,24 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
 
       // DataChannel 설정
       if (isInitiator) {
-        // Host가 DataChannel 생성
+        // Host가 DataChannel 생성하되, 실제 Offer는 guest가 붙은 뒤 negotiationneeded에서 처리
         const DataChannel = pc.createDataChannel("game-data", {
           ordered: true, // 메시지를 보낸 순서대로 상대방이 수신하도록 보장한다.
           maxRetransmits: 3, // 데이터 전송 실패 시 최대 3번까지 재전송을 시도한다.
         });
         setupDataChannel(DataChannel);
 
-        // Offer 생성 및 전송
-        createAndSendOffer(pc);
+        pc.onnegotiationneeded = async () => {
+          if (!hasGuestRef.current) return;
+          if (isNegotiatingRef.current) return;
+          if (pc.signalingState !== "stable") return;
+          try {
+            isNegotiatingRef.current = true;
+            await createAndSendOffer(pc);
+          } finally {
+            isNegotiatingRef.current = false;
+          }
+        };
       } else {
         // Guest는 DataChannel 수신 대기
         pc.ondatachannel = (event) => {
@@ -307,10 +360,30 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     [roomId, onConnecitionChange, createAndSendOffer, flushMessageQueue, setupDataChannel]
   );
 
+  // 닫힌 PeerConnection을 재사용하지 않도록 보조 함수
+  const ensurePeerConnection = useCallback(
+    (isInitiator) => {
+      if (!peerConnectionRef.current || peerConnectionRef.current.signalingState === "closed") {
+        initializePeerConnection(isInitiator);
+      }
+      return peerConnectionRef.current;
+    },
+    [initializePeerConnection]
+  );
+
   useEffect(() => {
     initializePCRef.current = initializePeerConnection;
     attemptReconnectFuncRef.current = attemptReconnect;
   }, [initializePeerConnection, attemptReconnect]);
+
+  // 로비에서 방을 만들고 이동한 호스트가 동일 소켓으로 다시 초기화될 수 있도록 보조 처리
+  useEffect(() => {
+    const hostRoomId = sessionStorage.getItem("hostRoomId");
+    if (hostRoomId === roomId && !isHost) {
+      setIsHost(true);
+      initializePeerConnection(true);
+    }
+  }, [roomId, isHost, initializePeerConnection]);
 
   const setupSocketListeners = () => {
     const socket = socketRef.current;
@@ -325,33 +398,40 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
 
     socket.on("room-created", ({ roomId: newRoomId }) => {
       console.log("Room created:", newRoomId);
+      isPoliteRef.current = false; // host
       setIsHost(true);
       initializePeerConnection(true);
     });
 
     socket.on("room-joined", () => {
       console.log("Joined room");
+      isPoliteRef.current = true; // guest
       setIsHost(false);
       initializePeerConnection(false);
     });
 
     socket.on("guest-joined", ({ guestId }) => {
       console.log("Guest joined:", guestId);
-      if (peerConnectionRef.current) {
-        console.log("Creating offer as host...");
-        createAndSendOffer(peerConnectionRef.current);
-      } else {
-        console.error("PeerConnection not initialized yet");
-      }
+      hasGuestRef.current = true;
+      setGuestJoined(true);
+      isPoliteRef.current = false; // host side
+      // Offer는 onnegotiationneeded에서 한 번만 생성하도록 한다.
     });
 
     socket.on("offer", async ({ offer, from }) => {
       console.log("Received offer from", from);
+      hasGuestRef.current = true;
+      setGuestJoined(true);
+      // If we receive an offer, we are the polite peer
+      isPoliteRef.current = true;
       await handleOffer(offer);
     });
 
     socket.on("answer", async ({ answer, from }) => {
       console.log("Received answer from", from);
+      hasGuestRef.current = true;
+      setGuestJoined(true);
+      isPoliteRef.current = true;
       await handleAnswer(answer);
     });
 
@@ -364,6 +444,11 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     socket.on("game-init", ({ state }) => {
       console.log("Received game-init via signaling");
       onMessage?.({ type: "GAME_INIT", state });
+    });
+
+    socket.on("request-game-init", ({ from }) => {
+      console.log("Received request-game-init from", from);
+      onMessage?.({ type: "REQUEST_GAME_INIT", from });
     });
 
     socket.on("opponent-disconnected", () => {
@@ -394,6 +479,11 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
 
   // 정리
   const cleanup = () => {
+    const hostRoomId = sessionStorage.getItem("hostRoomId");
+    if (hostRoomId === roomId) {
+      sessionStorage.removeItem("hostRoomId");
+    }
+
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
     }
@@ -404,23 +494,17 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
 
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
     }
 
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-    }
+    // 공유 소켓은 끊지 않는다. (로비 ↔ 게임 이동 시 방이 사라지는 현상 방지)
+    // 리스너는 setupSocketListeners에서만 추가되므로 별도 해제 없이 재사용한다.
   };
 
-  // Signaling Server 연결
+  // Signaling Server 연결 (공용 소켓 재사용)
   useEffect(() => {
     if (!socketRef.current) {
-      socketRef.current = io(SIGNALING_SERVER, {
-        reconnection: true, // 재연결 시도 활성화
-        reconnectionDelay: 1000, // 첫 재연결 시도 딜레이 (1초)
-        reconnectionDelayMax: 5000, // 최대 재연결 딜레이 (5초)
-        reconnectionAttempts: 5, // 최대 재연결 시도 횟수 (5번)
-      });
-
+      socketRef.current = getSignalingSocket();
       setupSocketListeners();
     }
 
@@ -441,6 +525,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   return {
     connectionState,
     isHost,
+    guestJoined,
     createRoom,
     joinRoom,
     sendMessage,

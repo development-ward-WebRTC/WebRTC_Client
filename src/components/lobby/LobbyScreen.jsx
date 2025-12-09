@@ -3,9 +3,7 @@ import styles from "./LobbyScreen.module.css";
 import { FaPlus } from "react-icons/fa";
 import { IoReloadCircle } from "react-icons/io5";
 import { useNavigate } from "react-router-dom";
-import io from "socket.io-client";
-
-const SIGNALING_SERVER = import.meta.env.VITE_REACT_APP_SIGNALING_SERVER || "http://localhost:3000";
+import { getSignalingSocket, SIGNALING_SERVER } from "../../utils/signalingSocket";
 
 export default function LobbyScreen({ user, onChangeUsername }) {
   const [serverStatus, setServerStatus] = useState("연결 중...");
@@ -23,46 +21,58 @@ export default function LobbyScreen({ user, onChangeUsername }) {
   };
 
   useEffect(() => {
-    // Socket.IO 연결
-    const newSocket = io(SIGNALING_SERVER);
+    // Socket.IO 연결 (공용 소켓 재사용)
+    const newSocket = getSignalingSocket();
     socketRef.current = newSocket;
 
-    newSocket.on("connect", () => {
+    const onConnect = () => {
       console.log("Connected to signaling server", { id: newSocket.id });
       setServerStatus("연결됨");
       // 직접 newSocket을 사용하여 rooms 요청
       newSocket.emit("get-rooms");
-    });
+    };
 
-    newSocket.on("disconnect", (reason) => {
+    const onDisconnect = (reason) => {
       // reason: "io server disconnect", "transport close", "ping timeout", etc.
       console.log("Disconnected from signaling server", { reason, id: newSocket.id });
       setServerStatus("연결 끊김");
-    });
+    };
 
-    newSocket.on("room-created", ({ roomId }) => {
+    const onRoomCreated = ({ roomId }) => {
       console.log("Room created:", roomId);
+      sessionStorage.setItem("hostRoomId", roomId);
       // 로그를 남기고 네비게이션 진행
       console.log("Navigating to game", { roomId, socketId: newSocket.id });
       navigate(`/game/${roomId}`);
-    });
+    };
 
-    newSocket.on("room-list", ({ rooms }) => {
+    const onRoomList = ({ rooms }) => {
       setRooms(rooms);
-    });
+    };
+
+    newSocket.on("connect", onConnect);
+    newSocket.on("disconnect", onDisconnect);
+    newSocket.on("room-created", onRoomCreated);
+    newSocket.on("room-list", onRoomList);
+
+    // 주기적으로 방 목록 요청 (guest가 대기 중 방을 보게)
+    const intervalId = setInterval(() => {
+      newSocket.emit("get-rooms");
+    }, 3000);
 
     return () => {
-      if (newSocket) {
-        // 컴포넌트 언마운트 시 소켓을 끊지 않고 리스너만 제거합니다.
-        newSocket.removeAllListeners();
-      }
+      clearInterval(intervalId);
+      newSocket.off("connect", onConnect);
+      newSocket.off("disconnect", onDisconnect);
+      newSocket.off("room-created", onRoomCreated);
+      newSocket.off("room-list", onRoomList);
     };
   }, []);
 
   const handleCreateRoom = () => {
     if (socketRef.current) {
       socketRef.current.emit("create-room", {
-        userId: null,
+        userId: user.userId || null,
       });
     }
   };

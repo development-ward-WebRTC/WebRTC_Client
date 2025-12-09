@@ -10,7 +10,7 @@ const GameBoard = ({ user }) => {
   const [spellTarget, setSpellTarget] = useState(null);
 
   // WebRTC 연결
-  const { connectionState, isHost, sendMessage, joinRoom, emitSignaling } = useWebRTC(
+  const { connectionState, isHost, guestJoined, sendMessage, joinRoom, emitSignaling } = useWebRTC(
     roomId,
     handleMessage,
     handleConnectionChange
@@ -33,13 +33,48 @@ const GameBoard = ({ user }) => {
     handleGameInit,
   } = useGameState(playerId, sendMessage, isHost, emitSignaling);
 
-  // 방 참가 (Host가 아닐 때만)
+  // 방 참가 (Host가 아닐 때만; 로비에서 만든 호스트는 sessionStorage로 구분)
   useEffect(() => {
-    if (roomId && !isHost) {
+    const hostRoomId = sessionStorage.getItem("hostRoomId");
+    if (roomId && !isHost && hostRoomId !== roomId) {
       // Guest만 방에 참가
       joinRoom(roomId, user.userId);
     }
   }, [roomId, isHost, joinRoom]);
+
+  // 게스트가 늦게 들어온 경우, Host가 초기 상태를 다시 전송
+  useEffect(() => {
+    if (isHost && guestJoined && gameState) {
+      // 데이터채널로 전송
+      sendMessage({
+        type: "GAME_INIT",
+        state: gameState,
+      });
+      // 시그널링 백업 전송
+      emitSignaling("game-init", { state: gameState });
+    }
+  }, [isHost, guestJoined, gameState, sendMessage, emitSignaling]);
+
+  // 연결/상태 백업 전송 및 요청
+  useEffect(() => {
+    if (isHost && connectionState === "connected" && gameState) {
+      sendMessage({
+        type: "GAME_INIT",
+        state: gameState,
+      });
+      emitSignaling("game-init", { state: gameState });
+    }
+
+    if (!isHost && connectionState === "connected" && !gameState) {
+      emitSignaling("request-game-init", { requester: user.userId });
+      const timer = setTimeout(() => {
+        if (!gameState) {
+          emitSignaling("request-game-init", { requester: user.userId, retry: true });
+        }
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [isHost, connectionState, gameState, sendMessage, emitSignaling, user.userId]);
 
   // 메시지 처리
   function handleMessage(message) {
@@ -49,6 +84,12 @@ const GameBoard = ({ user }) => {
         break;
       case "GAME_ACTION":
         handleRemoteAction(message.action);
+        break;
+      case "REQUEST_GAME_INIT":
+        if (isHost && gameState) {
+          sendMessage({ type: "GAME_INIT", state: gameState });
+          emitSignaling("game-init", { state: gameState });
+        }
         break;
       default:
         console.warn("Unknown message type:", message.type);
