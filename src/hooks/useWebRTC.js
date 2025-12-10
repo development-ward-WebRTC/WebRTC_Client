@@ -187,7 +187,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     const channel = dataChannelRef.current;
 
     if (!channel || channel.readyState !== "open") {
-      console.log("Channel not ready, queueing message");
+      console.log(`📤 Channel not ready (${channel?.readyState}), queueing message:`, message.type, "Queue size:", messageQueueRef.current.length);
       /* 
         messageQueueRef.current.push(message): 전송하려던 메시지를 **messageQueueRef (메시지 큐)**에 저장합니다. 이 큐에 저장된 메시지는 나중에 DataChannel이 "open" 상태가 되거나, 내부 버퍼가 비었을 때 (onbufferedamountlow) flushMessageQueue() 함수를 통해 일괄 전송된다.
       */
@@ -198,10 +198,10 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
     try {
       const data = JSON.stringify(message);
       channel.send(data);
-      console.log("Sent:", message.type);
+      console.log("✉️ Sent:", message.type);
       return true;
     } catch (error) {
-      console.error("Failed to send message:", error);
+      console.error("❌ Failed to send message:", error);
       messageQueueRef.current.push(message);
       return false;
     }
@@ -209,11 +209,20 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
 
   // 대기 중인 메시지 전송
   const flushMessageQueue = useCallback(() => {
+    const queueSize = messageQueueRef.current.length;
+    if (queueSize > 0) {
+      console.log(`📨 Flushing message queue (${queueSize} messages)...`);
+    }
+    
     while (messageQueueRef.current.length > 0) {
       // shift(): 배열의 가장 앞쪽 요소를 제거하고 그 요소를 반환한다
       const message = messageQueueRef.current.shift();
       // 재귀적 호출
       sendMessage(message);
+    }
+    
+    if (queueSize > 0) {
+      console.log(`✅ Flushed ${queueSize} messages from queue`);
     }
   }, [sendMessage]);
 
@@ -227,13 +236,20 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   const setupDataChannel = useCallback(
     (channel) => {
       dataChannelRef.current = channel;
+      
+      console.log("🔧 Setting up DataChannel, current state:", channel.readyState);
 
       channel.onopen = () => {
-        console.log("DataChannel opened");
+        console.log("✅ DataChannel opened! State:", channel.readyState);
+        flushMessageQueue();
       };
 
       channel.onclose = () => {
-        console.log("DataChannel closed");
+        console.log("❌ DataChannel closed");
+      };
+      
+      channel.onerror = (error) => {
+        console.error("💥 DataChannel error:", error);
       };
 
       channel.onmessage = (event) => {
@@ -314,22 +330,31 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
 
       // 연결 상태 변경
       pc.onconnectionstatechange = () => {
-        console.log("Connection state:", pc.connectionState);
+        console.log("🔗 Connection state:", pc.connectionState, "ICE:", pc.iceConnectionState, "Signaling:", pc.signalingState);
         // React의 상태를 업데이트하여 UI에 현재 연결 상태를 표시한다
         setConnectionState(pc.connectionState);
+        // peerConnection state도 업데이트 (닫힌 PC를 참조하지 않도록)
+        if (pc.connectionState !== "closed") {
+          setPeerConnectionState(pc);
+        }
         // onConnecitionChange?.(...): 외부에서 전달받은 콜백 함수를 호출하여 연결 상태 변화를 상위 컴포넌트나 다른 훅에 알린다.
         onConnecitionChange?.(pc.connectionState);
 
         if (pc.connectionState === "connected") {
-          console.log("P2P connection established");
+          console.log("✅ P2P connection established");
           // 대기 중인 메시지 전송
           flushMessageQueue();
         } else if (pc.connectionState === "disconnected") {
-          console.log("Connection disconnected, attempting reconnect...");
+          console.log("⚠️ Connection disconnected, attempting reconnect...");
           attemptReconnectFuncRef.current?.();
         } else if (pc.connectionState === "failed") {
-          console.log("Connection failed");
+          console.log("❌ Connection failed");
         }
+      };
+      
+      // ICE 연결 상태 추가 모니터링
+      pc.oniceconnectionstatechange = () => {
+        console.log("🧊 ICE connection state:", pc.iceConnectionState);
       };
 
       // DataChannel 설정
@@ -407,7 +432,29 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       hasGuestRef.current = true;
       setGuestJoined(true);
       isPoliteRef.current = false; // host side
-      // Offer는 onnegotiationneeded에서 한 번만 생성하도록 한다.
+      
+      // negotiationneeded가 이미 발생했거나 발생하지 않을 수 있으므로 수동으로 Offer 생성
+      const pc = peerConnectionRef.current;
+      if (pc && pc.signalingState === "stable" && !isNegotiatingRef.current) {
+        console.log("🔄 Manually triggering offer creation...");
+        // negotiationneeded를 기다리지 않고 직접 Offer 생성
+        setTimeout(async () => {
+          if (!isNegotiatingRef.current && pc.signalingState === "stable") {
+            try {
+              isNegotiatingRef.current = true;
+              await createAndSendOffer(pc);
+            } finally {
+              isNegotiatingRef.current = false;
+            }
+          }
+        }, 100); // DataChannel 설정 완료 대기
+      } else {
+        console.warn("⚠️ Cannot create offer:", {
+          hasPc: !!pc,
+          signalingState: pc?.signalingState,
+          isNegotiating: isNegotiatingRef.current,
+        });
+      }
     });
 
     socket.on("offer", async ({ offer, from }) => {
@@ -470,7 +517,7 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
   }, []);
 
   // 정리
-  const cleanup = () => {
+  const cleanup = (force = false) => {
     const hostRoomId = sessionStorage.getItem("hostRoomId");
     if (hostRoomId === roomId) {
       sessionStorage.removeItem("hostRoomId");
@@ -480,13 +527,19 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       clearTimeout(reconnectTimeoutRef.current);
     }
 
-    if (dataChannelRef.current) {
-      dataChannelRef.current.close();
-    }
+    // force가 true이거나 DataChannel이 이미 닫혔을 때만 정리
+    if (force || dataChannelRef.current?.readyState === "closed") {
+      if (dataChannelRef.current && force) {
+        dataChannelRef.current.close();
+      }
 
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
+      if (peerConnectionRef.current && force) {
+        console.log("🧹 Cleanup: Closing PeerConnection (force)");
+        peerConnectionRef.current.close();
+        peerConnectionRef.current = null;
+      }
+    } else {
+      console.log("🔄 Cleanup: Skipping PeerConnection close (connection active)");
     }
 
     // 공유 소켓은 끊지 않는다. (로비 ↔ 게임 이동 시 방이 사라지는 현상 방지)
@@ -500,8 +553,10 @@ export const useWebRTC = (roomId, onMessage, onConnecitionChange) => {
       setupSocketListeners();
     }
 
+    // cleanup은 실행하지 않음 (PeerConnection을 유지해야 함)
+    // 필요 시 컴포넌트 최종 언마운트에서만 cleanup 호출
     return () => {
-      cleanup();
+      // cleanup(); // ← 주석 처리: setupSocketListeners 변경 시마다 연결이 끊기는 문제 방지
     };
   }, [setupSocketListeners]);
 

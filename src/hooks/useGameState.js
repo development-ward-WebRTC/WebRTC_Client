@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { CARD_DATABASE } from "../utils/cardData";
 import { applyAction, validateAction } from "../utils/gameLogic";
 
@@ -8,6 +8,8 @@ const INITIAL_HAND_SIZE = 5;
 export const useGameState = (playerId, sendMessage, isHost, signalingEmit) => {
   const [gameState, setGameState] = useState(null);
   const [selectedCard, setSelectedCard] = useState(null);
+  const pendingActionsRef = useRef([]); // gameState 초기화 전 받은 액션 버퍼
+  const gameStateRef = useRef(null); // 최신 gameState를 항상 참조하기 위한 ref
 
   // 덱 셔플
   const shuffleDeck = useCallback((deck) => {
@@ -75,6 +77,7 @@ export const useGameState = (playerId, sendMessage, isHost, signalingEmit) => {
     };
 
     setGameState(initialState);
+    gameStateRef.current = initialState; // ref 즉시 업데이트
 
     // Host가 초기 상태를 Guest에게 전송
     if (isHost) {
@@ -93,7 +96,7 @@ export const useGameState = (playerId, sendMessage, isHost, signalingEmit) => {
         }
       }, 1000); // 연결 완료 대기
     }
-  }, [isHost, sendMessage, gameState, shuffleDeck, signalingEmit]);
+  }, [isHost, sendMessage, shuffleDeck, signalingEmit]); // gameState 제거하여 무한 루프 방지
 
   useEffect(() => {
     // Host일 때만 초기화 (Guest가 로컬에서 초기화하지 않도록 함)
@@ -106,6 +109,12 @@ export const useGameState = (playerId, sendMessage, isHost, signalingEmit) => {
   // 액션 실행 (로컬 + 전송)
   const executeAction = useCallback(
     (action) => {
+      console.log("executeAction - action:", action, "playerId:", playerId, "gameState:", {
+        currentPlayer: gameState?.currentPlayer,
+        phase: gameState?.phase,
+        turn: gameState?.turn,
+      });
+
       if (!gameState) {
         console.error("Game state not initialized");
         return false;
@@ -113,6 +122,8 @@ export const useGameState = (playerId, sendMessage, isHost, signalingEmit) => {
 
       // 액션 유효성 검증
       const validation = validateAction(gameState, action, playerId);
+      console.log("Validation result:", validation);
+      
       if (!validation.valid) {
         console.error("Invalid action:", validation.error);
         alert(validation.error);
@@ -121,43 +132,96 @@ export const useGameState = (playerId, sendMessage, isHost, signalingEmit) => {
 
       // 로컬 상태 업데이트
       const newState = applyAction(gameState, action);
+      console.log("✅ New state after action:", {
+        currentPlayer: newState.currentPlayer,
+        phase: newState.phase,
+        turn: newState.turn,
+      });
       setGameState(newState);
 
       // 상대방에게 전송
-      sendMessage({
+      const message = {
         type: "GAME_ACTION",
         action,
         timestamp: Date.now(),
-      });
+      };
+      console.log("📤 Sending action to opponent:", action.type);
+      const sent = sendMessage(message);
+      console.log("📤 Message sent result:", sent);
 
       return true;
     },
     [gameState, playerId, sendMessage]
   );
 
+  // gameState 변경 시 ref 동기화
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
+
   // 원격 액션 처리
   const handleRemoteAction = useCallback(
     (action) => {
-      if (!gameState) {
-        console.error("Game state not initialized");
+      const currentState = gameStateRef.current; // 최신 gameState 사용
+      console.log("📥 handleRemoteAction - action:", action, "current gameState:", {
+        currentPlayer: currentState?.currentPlayer,
+        phase: currentState?.phase,
+        turn: currentState?.turn,
+      });
+
+      if (!currentState) {
+        console.warn("⚠️ Game state not initialized yet, buffering action:", action.type);
+        pendingActionsRef.current.push(action);
         return;
       }
 
       // 상대방의 액션 적용
-      const newState = applyAction(gameState, action);
+      const newState = applyAction(currentState, action);
+      console.log("✅ Remote action applied - new state:", {
+        currentPlayer: newState.currentPlayer,
+        phase: newState.phase,
+        turn: newState.turn,
+      });
       setGameState(newState);
+      gameStateRef.current = newState; // ref도 즉시 업데이트
     },
-    [gameState]
+    [] // gameState 의존성 제거, gameStateRef 사용
   );
 
   // 게임 초기화 수신 (Guest용)
   const handleGameInit = useCallback((initialState) => {
-    console.log("Received game initialization");
+    console.log("🎮 Received game initialization, initial state:", {
+      currentPlayer: initialState?.currentPlayer,
+      phase: initialState?.phase,
+      turn: initialState?.turn,
+    });
     setGameState(initialState);
+    gameStateRef.current = initialState; // ref 즉시 업데이트
+    
+    // 버퍼에 쌓인 액션들 처리
+    if (pendingActionsRef.current.length > 0) {
+      console.log(`📦 Processing ${pendingActionsRef.current.length} buffered actions...`);
+      let currentState = initialState;
+      
+      pendingActionsRef.current.forEach((action, index) => {
+        console.log(`  ${index + 1}. Applying buffered action:`, action.type);
+        currentState = applyAction(currentState, action);
+      });
+      
+      console.log("✅ All buffered actions applied, final state:", {
+        currentPlayer: currentState.currentPlayer,
+        phase: currentState.phase,
+        turn: currentState.turn,
+      });
+      setGameState(currentState);
+      gameStateRef.current = currentState; // 최종 상태도 ref 업데이트
+      pendingActionsRef.current = [];
+    }
   }, []);
 
   // 카드 드로우
   const drawCard = useCallback(() => {
+    console.log("🎴 drawCard called - playerId:", playerId);
     return executeAction({
       type: "DRAW_CARD",
       player: playerId,

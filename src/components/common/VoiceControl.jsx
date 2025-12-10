@@ -4,42 +4,110 @@ const VoiceControl = ({ peerConnection, connectionState }) => {
   const [isVoiceEnabled, setIsVoiceEnabled] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [error, setError] = useState("");
+  const [warningShown, setWarningShown] = useState(false);
   const localStreamRef = useRef(null);
   const remoteAudioRef = useRef(null);
+  const trackAddedRef = useRef(false); // 트랙이 이미 추가되었는지 추적
 
   const startVoice = async () => {
     try {
       setError("");
 
       // 연결 상태 확인
-      const pc = peerConnection; // state로 전달되므로 .current 불필요
-      console.log("VoiceControl - connectionState:", connectionState, "peerConnection:", pc, "signalingState:", pc?.signalingState);
-      
-      if (!pc || pc.signalingState === "closed" || connectionState !== "connected") {
-        setError(`연결 상태가 아닙니다. (상태: ${connectionState}, signalingState: ${pc?.signalingState || "N/A"})`);
+      const pc = peerConnection;
+      console.log("VoiceControl startVoice - trackAdded:", trackAddedRef.current, "hasStream:", !!localStreamRef.current, "signalingState:", pc?.signalingState);
+
+      // 이미 스트림이 있으면 그냥 활성화만
+      if (localStreamRef.current && trackAddedRef.current) {
+        localStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+        });
+        setIsVoiceEnabled(true);
+        setIsMuted(false);
+        console.log("Voice chat re-enabled (track already added)");
         return;
       }
 
-      // 마이크 권한 요청
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
+      // PC 확인
+      if (!pc) {
+        setError("연결이 초기화되지 않았습니다. 페이지를 새로고침해주세요.");
+        return;
+      }
+      
+      if (pc.signalingState === "closed") {
+        if (!warningShown) {
+          alert("⚠️ WebRTC 연결이 닫혔습니다.\n\n음성 채팅을 사용하려면:\n1. 로비로 돌아가기\n2. 새로운 방 생성\n3. 게임 시작 후 바로 음성 활성화\n\n현재 게임은 계속 진행 가능합니다.");
+          setWarningShown(true);
+        }
+        setError("WebRTC 연결이 닫혔습니다. 새 게임을 시작해주세요.");
+        return;
+      }
+
+      // 브라우저 미디어 지원 확인 및 디버깅
+      console.log("🔍 Checking media support:", {
+        hasNavigator: !!navigator,
+        hasMediaDevices: !!navigator?.mediaDevices,
+        hasGetUserMedia: !!navigator?.mediaDevices?.getUserMedia,
+        isSecureContext: window.isSecureContext,
+        protocol: window.location.protocol,
       });
 
-      localStreamRef.current = stream;
+      // getUserMedia 참조 확인 (React DevTools hook 우회)
+      const getUserMedia = navigator?.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices)
+        || navigator?.getUserMedia?.bind(navigator)
+        || navigator?.webkitGetUserMedia?.bind(navigator)
+        || navigator?.mozGetUserMedia?.bind(navigator);
 
-      // 오디오 트랙을 PeerConnection에 추가
-      // 연결 상태를 다시 한 번 확인
-      if (pc && pc.signalingState !== "closed" && connectionState === "connected") {
+      if (!getUserMedia) {
+        setError("이 브라우저는 마이크 접근을 지원하지 않습니다.");
+        console.error("getUserMedia is not supported in this browser");
+        return;
+      }
+
+      // 마이크 권한 요청 (첫 번째만)
+      let stream;
+      try {
+        // 최신 API 우선 시도
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+            video: false,
+          });
+        } else {
+          // 레거시 API 폴백
+          stream = await new Promise((resolve, reject) => {
+            getUserMedia(
+              { audio: true, video: false },
+              resolve,
+              reject
+            );
+          });
+        }
+      } catch (getUserMediaError) {
+        console.error("getUserMedia error:", getUserMediaError);
+        throw getUserMediaError;
+      }
+
+      if (!stream) {
+        setError("마이크 스트림을 가져올 수 없습니다.");
+        return;
+      }
+
+      localStreamRef.current = stream;
+      console.log("✅ Got media stream:", stream.getTracks());
+
+      // 오디오 트랙을 PeerConnection에 추가 (첫 번째만)
+      if (pc && pc.signalingState !== "closed" && !trackAddedRef.current) {
         stream.getTracks().forEach((track) => {
-          // track.kind가 'audio'인 트랙만 추가하는 것이 안전합니다.
           if (track.kind === "audio") {
             try {
               pc.addTrack(track, stream);
+              trackAddedRef.current = true;
+              console.log("Audio track added successfully");
             } catch (err) {
               console.error("Failed to add track:", err);
               setError("오디오 트랙 추가 실패. 연결을 확인해주세요.");
@@ -48,16 +116,17 @@ const VoiceControl = ({ peerConnection, connectionState }) => {
             }
           }
         });
+      } else if (trackAddedRef.current) {
+        console.log("Track already added, just enabling");
       } else {
-        // PeerConnection이 없거나 닫힌 경우 경고 또는 오류 처리
-        console.error("PeerConnection is closed or not initialized. Cannot add track.");
-        setError("연결 상태가 아닙니다. 게임 연결 후 다시 시도해주세요.");
-        // 💡 닫힌 경우 스트림 자원 해제
+        console.error("PeerConnection is closed. Cannot add track.");
+        setError("연결이 종료되었습니다. 게임을 다시 시작해주세요.");
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
 
       setIsVoiceEnabled(true);
+      setIsMuted(false);
       console.log("Voice chat started");
     } catch (err) {
       console.error("Failed to start voice chat:", err);
@@ -73,14 +142,14 @@ const VoiceControl = ({ peerConnection, connectionState }) => {
 
   const stopVoice = () => {
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        track.stop();
+      // 트랙을 완전히 종료하지 않고 비활성화만 (재사용 가능)
+      localStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = false;
       });
-      localStreamRef.current = null;
     }
     setIsVoiceEnabled(false);
     setIsMuted(false);
-    console.log("Voice chat stopped");
+    console.log("Voice chat disabled (track kept for reuse)");
   };
 
   const toggleMute = () => {
@@ -101,8 +170,8 @@ const VoiceControl = ({ peerConnection, connectionState }) => {
   };
 
   useEffect(() => {
-    const pc = peerConnection; // state로 전달되므로 .current 불필요
-    if (!pc || connectionState !== "connected") return;
+    const pc = peerConnection;
+    if (!pc || pc.signalingState === "closed") return;
 
     // 원격 오디오 스트림 처리
     const handleTrack = (event) => {
@@ -116,19 +185,41 @@ const VoiceControl = ({ peerConnection, connectionState }) => {
 
     return () => {
       pc.removeEventListener("track", handleTrack);
-      stopVoice();
+      // cleanup 시 완전히 종료
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => {
+          track.stop();
+        });
+        localStreamRef.current = null;
+      }
+      trackAddedRef.current = false;
     };
-  }, [peerConnection, connectionState]);
+  }, [peerConnection]);
 
-  // 연결 상태 확인 (peerConnection과 connectionState 모두 확인)
-  const pc = peerConnection; // state로 전달되므로 .current 불필요
-  // connectionState가 "connected"이고 peerConnection이 존재하며 닫히지 않았으면 활성화
-  const isConnected = connectionState === "connected" && pc && pc.signalingState !== "closed" && pc.connectionState !== "closed";
+  // 연결 상태 확인
+  const pc = peerConnection;
+  const signalingState = pc?.signalingState;
+  const pcConnectionState = pc?.connectionState;
+  
+  // 버튼 활성화 조건:
+  // 1. PC가 존재하고
+  // 2. signalingState가 closed가 아니고 (또는 stable, have-local-offer 등)
+  // 3. connectionState가 closed가 아님
+  const isConnected = !!pc && signalingState !== "closed" && pcConnectionState !== "closed";
   
   // 디버깅용
   useEffect(() => {
-    console.log("VoiceControl - connectionState:", connectionState, "peerConnection:", pc, "signalingState:", pc?.signalingState, "connectionState:", pc?.connectionState, "isConnected:", isConnected);
-  }, [connectionState, pc, isConnected]);
+    console.log("🎤 VoiceControl render:", {
+      hasPeerConnection: !!pc,
+      signalingState: signalingState,
+      connectionState: connectionState,
+      pcConnectionState: pc?.connectionState,
+      iceConnectionState: pc?.iceConnectionState,
+      hasLocalDescription: !!pc?.localDescription,
+      hasRemoteDescription: !!pc?.remoteDescription,
+      isConnected: isConnected,
+    });
+  }, [pc, signalingState, connectionState, isConnected]);
 
   return (
     <div className="flex items-center gap-3">
@@ -172,8 +263,11 @@ const VoiceControl = ({ peerConnection, connectionState }) => {
         </button>
       )}
 
-      {/* 에러 메시지 */}
-      {error && <span className="text-red-400 text-sm">{error}</span>}
+      {/* 에러/경고 메시지 */}
+      {error && <span className="text-red-400 text-sm font-semibold">{error}</span>}
+      {!error && signalingState === "closed" && (
+        <span className="text-yellow-400 text-sm">⚠️ 연결 끊김 (게임 재시작 필요)</span>
+      )}
     </div>
   );
 };

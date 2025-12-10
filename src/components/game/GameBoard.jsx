@@ -34,6 +34,18 @@ const GameBoard = ({ user }) => {
     handleGameInit,
   } = useGameState(playerId, sendMessage, isHost, emitSignaling);
 
+  // 디버깅: gameState 변경 추적
+  useEffect(() => {
+    console.log("🎯 GameBoard gameState updated:", {
+      hasGameState: !!gameState,
+      currentPlayer: gameState?.currentPlayer,
+      phase: gameState?.phase,
+      turn: gameState?.turn,
+      playerId,
+      isMyTurn,
+    });
+  }, [gameState, playerId, isMyTurn]);
+
   // 방 참가 (Host가 아닐 때만; 로비에서 만든 호스트는 sessionStorage로 구분)
   useEffect(() => {
     const hostRoomId = sessionStorage.getItem("hostRoomId");
@@ -43,9 +55,10 @@ const GameBoard = ({ user }) => {
     }
   }, [roomId, isHost, joinRoom]);
 
-  // 게스트가 늦게 들어온 경우, Host가 초기 상태를 다시 전송
+  // 게스트가 늦게 들어온 경우, Host가 초기 상태를 다시 전송 (한 번만)
   useEffect(() => {
     if (isHost && guestJoined && gameState) {
+      console.log("🎮 Host: Guest joined, sending game state");
       // 데이터채널로 전송
       sendMessage({
         type: "GAME_INIT",
@@ -54,20 +67,13 @@ const GameBoard = ({ user }) => {
       // 시그널링 백업 전송
       emitSignaling("game-init", { state: gameState });
     }
-  }, [isHost, guestJoined, gameState, sendMessage, emitSignaling]);
+    // gameState를 의존성에서 제거하여 무한 루프 방지
+    // guestJoined가 true가 될 때만 한 번 실행됨
+  }, [isHost, guestJoined, sendMessage, emitSignaling]);
 
-  // 연결/상태 백업 전송 및 요청
+  // 게스트가 gameState를 받지 못했을 때 재요청
   useEffect(() => {
-    if (isHost && connectionState === "connected" && gameState) {
-      sendMessage({
-        type: "GAME_INIT",
-        state: gameState,
-      });
-      emitSignaling("game-init", { state: gameState });
-    }
-
     // 게스트가 방에 참가했는데 초기 상태가 없으면 호스트에게 요청
-    // 연결 상태와 관계없이 요청 (시그널링으로 받을 수 있음)
     if (!isHost && !gameState) {
       const timer1 = setTimeout(() => {
         if (!gameState) {
@@ -92,12 +98,15 @@ const GameBoard = ({ user }) => {
       
       return () => clearTimeout(timer1);
     }
-  }, [isHost, connectionState, gameState, sendMessage, emitSignaling, user.userId]);
+    // gameState를 의존성에서 제거하여 무한 루프 방지
+  }, [isHost, connectionState, emitSignaling, user.userId]);
 
   // 메시지 처리
   function handleMessage(message) {
+    console.log("📨 handleMessage received:", message.type);
     switch (message.type) {
       case "GAME_INIT":
+        console.log("🎮 Processing GAME_INIT with state:", !!message.state);
         handleGameInit(message.state);
         break;
       case "GAME_ACTION":
@@ -105,12 +114,13 @@ const GameBoard = ({ user }) => {
         break;
       case "REQUEST_GAME_INIT":
         if (isHost && gameState) {
+          console.log("🔄 Host responding to REQUEST_GAME_INIT");
           sendMessage({ type: "GAME_INIT", state: gameState });
           emitSignaling("game-init", { state: gameState });
         }
         break;
       default:
-        console.warn("Unknown message type:", message.type);
+        console.warn("❓ Unknown message type:", message.type);
     }
   }
 
@@ -200,16 +210,32 @@ const GameBoard = ({ user }) => {
 
   // 페이즈 진행
   const handleAdvancePhase = () => {
-    if (!isMyTurn) return;
+    console.log("🎯 handleAdvancePhase clicked:", {
+      playerId,
+      currentPlayer: gameState?.currentPlayer,
+      isMyTurn,
+      phase: gameState?.phase,
+      isHost,
+    });
+    
+    if (!isMyTurn) {
+      console.error("❌ Not your turn! playerId:", playerId, "currentPlayer:", gameState?.currentPlayer);
+      alert(`현재 차례가 아닙니다!\n당신: ${playerId}\n현재 플레이어: ${gameState?.currentPlayer}`);
+      return;
+    }
 
-    if (gameState.phase == "draw") {
-      drawCard();
+    if (gameState.phase === "draw") {
+      console.log("📥 Calling drawCard...");
+      const result = drawCard();
+      console.log("📥 drawCard result:", result);
     } else if (gameState.phase === "main") {
+      console.log("⚔️ Advancing to combat phase...");
       sendMessage({
         type: "GAME_ACTION",
         action: { type: "PHASE_CHANGE", phase: "combat", player: playerId },
       });
     } else if (gameState.phase === "combat") {
+      console.log("🔚 Ending turn...");
       endTurn();
     }
   };
@@ -286,6 +312,9 @@ const GameBoard = ({ user }) => {
           <span className="text-gray-400">{connectionStatus}</span>
           <span className={`font-bold ${isMyTurn ? "text-green-400" : "text-gray-400"}`}>
             {isMyTurn ? "내 턴 ⭐" : "상대 턴"}
+          </span>
+          <span className="text-xs text-gray-500">
+            (나: {playerId} / 현재: {gameState.currentPlayer})
           </span>
         </div>
         <div className="flex items-center gap-4">
